@@ -434,6 +434,16 @@ impl Router {
             if let Some(connections) = self.subscription_map.get_mut(filter) {
                 connections.remove(&id);
             }
+
+            match retrieve_shared_group(&filter) {
+                (Some(group), Some(clean_filter)) => {
+                    if let Some(device_data) = self.datalog.device_data(&clean_filter) {
+                        debug!("Unsubscribing client from shared-group: {}", &group);
+                        device_data.unregister_shared_cursor(group, &connection.client_id)
+                    }
+                }
+                _ => {}
+            }
         }
 
         // Add disconnection event to metrics
@@ -458,16 +468,8 @@ impl Router {
 
             for request in tracker.data_requests.iter_mut() {
                 if let Some(cursor) = retransmissions.get(&request.filter_idx) {
-                    request.cursor = *cursor;
                     // reset the group cursor as well
-                    if let Some(group_name) = &request.group {
-                        self.datalog
-                            .native
-                            .get_mut(request.filter_idx)
-                            .unwrap()
-                            .shared_cursors
-                            .insert(group_name.to_string(), *cursor);
-                    }
+                    request.cursor = *cursor;
                 }
             }
 
@@ -618,22 +620,9 @@ impl Router {
                         info!("Adding subscription on topic {}", f.path);
                         let connection = self.connections.get_mut(id).unwrap();
 
-                        let mut group: Option<String> = None;
                         let original_filter: String = f.path.clone();
-
-                        if let Some(share_filter) = original_filter.strip_prefix("$share/") {
-                            // TODO: handle error cases
-                            let filter_path = share_filter
-                                .split_once('/')
-                                .map(|(group_name, filter_path)| {
-                                    // set group name
-                                    group = Some(group_name.to_string());
-
-                                    filter_path.to_string()
-                                })
-                                .unwrap();
-
-                            // filter path without prefix and group name
+                        let (group, filter_path) = retrieve_shared_group(&f.path);
+                        if let Some(filter_path) = filter_path {
                             f.path = filter_path;
                         }
 
@@ -677,6 +666,17 @@ impl Router {
                     for filter in &unsubscribe.filters {
                         let span = tracing::info_span!("unsubscribe", topic = filter, pkid);
                         let _guard = span.enter();
+
+                        match retrieve_shared_group(&filter) {
+                            (Some(group), Some(clean_filter)) => {
+                                if let Some(device_data) = self.datalog.device_data(&clean_filter) {
+                                    debug!("Unsubscribing client from shared-group: {}", &group);
+                                    device_data
+                                        .unregister_shared_cursor(group, &connection.client_id)
+                                }
+                            }
+                            _ => {}
+                        }
 
                         debug!("Removing subscription on filter {}", filter);
                         if let Some(connection_ids) = self.subscription_map.get_mut(filter) {
@@ -861,18 +861,17 @@ impl Router {
             }
         }
 
+        // Prepare consumer to pull data in case of subscription
+        let connection = self.connections.get_mut(id).unwrap();
+
         // set the shared cursor in case of shared subscription
         if let Some(ref group_name) = group {
             self.datalog
                 .native
                 .get_mut(filter_idx)
                 .unwrap()
-                .shared_cursors
-                .insert(group_name.to_string(), cursor);
+                .register_shared_cursor(group_name.to_owned(), connection.client_id.clone());
         }
-
-        // Prepare consumer to pull data in case of subscription
-        let connection = self.connections.get_mut(id).unwrap();
 
         if connection.subscriptions.insert(filter.clone()) {
             let request = DataRequest {
@@ -1113,6 +1112,8 @@ fn append_to_commitlog(
     let mut o = (0, 0);
     for filter_idx in filter_idxs {
         let datalog = datalog.native.get_mut(filter_idx).unwrap();
+        // Move all the shared cursors for this filter
+        datalog.move_shared_cursors();
         let publish_data = (publish.clone(), properties.clone());
         let (offset, filter) = datalog.append(publish_data.into(), notifications);
         debug!(
@@ -1218,17 +1219,6 @@ fn forward_device_data(
     let span = tracing::info_span!("outgoing_publish", client_id = outgoing.client_id);
     let _guard = span.enter();
 
-    if let Some(group_name) = &request.group {
-        // update the request cursor to use shared cursor
-        request.cursor = *datalog
-            .native
-            .get(request.filter_idx)
-            .unwrap()
-            .shared_cursors
-            .get(group_name)
-            .unwrap();
-    }
-
     trace!(
         "Reading from datalog: {}[{}, {}]",
         request.filter,
@@ -1293,13 +1283,11 @@ fn forward_device_data(
     // println!("{:?} {:?} {}", start, next, request.read_count);
 
     if let Some(group_name) = &request.group {
-        // update the shared cursor
-        datalog
-            .native
-            .get_mut(request.filter_idx)
-            .unwrap()
-            .shared_cursors
-            .insert(group_name.to_string(), next);
+        // check if we are the client in the shared-subscription that should recieve the publish
+        let filter_data = datalog.native.get_mut(request.filter_idx).unwrap();
+        if !filter_data.is_current_shared_cursor(group_name, &outgoing.client_id) {
+            return ConsumeStatus::FilterCaughtup;
+        }
     }
 
     if publishes.is_empty() {
@@ -1495,6 +1483,20 @@ fn validate_clientid(client_id: &str) -> Result<(), RouterError> {
     }
 
     Ok(())
+}
+
+/// Strips the $share part and if it was found, returns the group and the filter without $share/group
+fn retrieve_shared_group(filter: &Filter) -> (Option<String>, Option<String>) {
+    if let Some(share_filter) = filter.strip_prefix("$share/") {
+        if let Some((g, f)) = share_filter
+            .split_once('/')
+            .map(|(group, filter_path)| (group.to_owned(), filter_path.to_owned()))
+        {
+            return (Some(g), Some(f));
+        }
+    }
+
+    return (None, None);
 }
 
 // #[cfg(test)]

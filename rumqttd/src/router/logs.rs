@@ -11,7 +11,7 @@ use crate::{ConnectionId, Filter, Offset, RouterConfig, Topic};
 
 use crate::segments::{CommitLog, Position};
 use crate::Storage;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::time::Instant;
 
@@ -99,6 +99,10 @@ impl DataLog {
         self.native
             .get(*self.filter_indexes.get(filter)?)
             .map(|data| &data.waiters)
+    }
+
+    pub fn device_data(&mut self, filter: &Filter) -> Option<&mut Data<PublishData>> {
+        self.native.get_mut(*self.filter_indexes.get(filter)?)
     }
 
     pub fn remove_waiters_for_id(
@@ -299,7 +303,12 @@ pub struct Data<T> {
     pub log: CommitLog<T>,
     pub waiters: Waiters<DataRequest>,
     meter: SubscriptionMeter,
-    pub(crate) shared_cursors: HashMap<String, (u64, u64)>,
+    shared_cursors: HashMap<String, SharedCursor>,
+}
+
+struct SharedCursor {
+    clients: HashSet<String>,
+    current_client: String,
 }
 
 impl<T> Data<T>
@@ -337,6 +346,74 @@ where
         self.meter.total_size += size;
 
         (offset, &self.filter)
+    }
+
+    /// Registers a client for a shared subscription.
+    pub fn register_shared_cursor(&mut self, group_name: String, client_id: String) {
+        let entry = self
+            .shared_cursors
+            .entry(group_name)
+            .or_insert(SharedCursor {
+                clients: HashSet::default(),
+                current_client: client_id.clone(),
+            });
+        entry.clients.insert(client_id);
+    }
+
+    /// Removes a client from a shared subscription
+    pub fn unregister_shared_cursor(&mut self, group_name: String, client_id: &str) {
+        let mut move_cursor = false;
+        self.shared_cursors.entry(group_name).and_modify(|entry| {
+            entry.clients.remove(client_id);
+            if entry.current_client == client_id {
+                move_cursor = true;
+            }
+        });
+        if move_cursor {
+            self.move_shared_cursors();
+        }
+    }
+
+    /// Checks if this client is the one that should recieve the next message for the shared subscription
+    pub fn is_current_shared_cursor(&self, group_name: &str, client_id: &str) -> bool {
+        if let Some(shared_cursor) = self.shared_cursors.get(group_name) {
+            shared_cursor.current_client == client_id
+        } else {
+            false
+        }
+    }
+
+    /// Performs round-robin strategy for moving a shared cursor also removes empty groups from the state.
+    pub fn move_shared_cursors(&mut self) {
+        self.shared_cursors.retain(|_, shared_cursor| {
+            // There could technically be a case where we have removed the client from the set,
+            // To prevent infinite loop, we make sure that it is in the set, O(1) look up anyway.
+            if !shared_cursor
+                .clients
+                .contains(&shared_cursor.current_client)
+            {
+                // If current one was not in the list, pick one at "random" (the first one)
+                // if there isn't a next one, aka empty list, drop this group
+                if let Some(next) = shared_cursor.clients.iter().next() {
+                    shared_cursor.current_client = next.to_owned();
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            let mut client_cycle = shared_cursor.clients.iter().cycle();
+            while let Some(client) = client_cycle.next() {
+                if client == &shared_cursor.current_client {
+                    break;
+                }
+            }
+
+            if let Some(next) = client_cycle.next() {
+                shared_cursor.current_client = next.to_owned();
+            }
+
+            true
+        })
     }
 }
 
